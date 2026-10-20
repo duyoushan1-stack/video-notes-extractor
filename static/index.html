@@ -1,6 +1,64 @@
 <!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Notes Extractor</title><style>
-:root{font-family:system-ui,'Noto Sans TC',sans-serif;color:#243445;background:#f5f7f8}*{box-sizing:border-box}main{max-width:800px;margin:5vh auto;padding:24px}header{margin-bottom:24px}h1{font-size:clamp(26px,4vw,38px);letter-spacing:-1px}p{color:#64748b;line-height:1.7}.panel{background:white;padding:28px;border-radius:22px;box-shadow:0 12px 50px #19334b0c}label{display:block;font-weight:650;margin:18px 0 8px}input,select{width:100%;padding:14px;border:1px solid #d8e0e8;border-radius:10px;font:inherit}button,a.action{display:inline-block;border:0;border-radius:11px;background:#175d60;color:white;padding:13px 22px;font:inherit;cursor:pointer;text-decoration:none;margin-top:18px}button:disabled{opacity:.5;cursor:not-allowed}.row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:160px}small{color:#718096}#result{white-space:pre-wrap;line-height:1.7;margin-top:20px}progress{width:100%;height:12px;accent-color:#175d60}#download{display:none}footer{margin-top:20px;font-size:13px;color:#64748b}
-</style></head><body><main><header><h1>Video Notes Extractor</h1><p>貼上 YouTube 影片網址，自動偵測畫面變化、對齊逐字稿，匯出 Markdown 圖文筆記。</p></header><section class="panel"><form id="form"><label for="url">影片網址</label><input id="url" type="url" required value="https://www.youtube.com/watch?v=3C7kPucHpSk"><div class="row"><div><label for="threshold">場景偵測敏感度</label><input id="threshold" type="number" min="0.1" max="0.8" step="0.01" value="0.32"><small>數字越小越敏感；現在採用全片每 2 秒取樣與差異去重</small></div><div><label for="gap">最短截圖間隔（秒）</label><input id="gap" type="number" min="2" max="60" value="4"></div><div><label for="max">最多截圖張數</label><input id="max" type="number" min="1" max="300" value="300"></div></div><div class="row"><div><label><input id="summary" type="checkbox" style="width:auto"> 產出摘要（summary.md）</label><select id="summary-language" aria-label="摘要語系"><option value="zh-TW">繁體中文</option><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div><div><label for="translate">翻譯語系</label><select id="translate"><option value="">不翻譯</option><option value="zh-TW">繁體中文</option><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div></div><small>摘要、翻譯，以及無章節影片的 AI 自動分章，需在伺服器設定 GEMINI_API_KEY</small><br><button id="start" type="submit">開始擷取</button></form><div id="result" role="status" aria-live="polite"></div><progress id="progress" max="100" value="0" hidden></progress><a class="action" id="download">下載 ZIP</a></section><footer>個人使用 MVP。請勿公開部署未設身分驗證的服務；僅處理有權存取及保存的影片。</footer></main><script>
-const form=document.getElementById('form'),result=document.getElementById('result'),progress=document.getElementById('progress'),start=document.getElementById('start'),download=document.getElementById('download');
-form.addEventListener('submit',async e=>{e.preventDefault();start.disabled=true;download.style.display='none';progress.hidden=false;progress.value=0;result.textContent='正在建立任務…';try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.getElementById('url').value,threshold:Number(document.getElementById('threshold').value),min_gap:Number(document.getElementById('gap').value),max_frames:Number(document.getElementById('max').value),summary:document.getElementById('summary').checked,summary_language:document.getElementById('summary-language').value,translate:document.getElementById('translate').value})});const j=await r.json();if(!r.ok)throw Error(j.detail||'無法建立任務');let state=j;while(!['done','failed'].includes(state.status)){await new Promise(resolve=>setTimeout(resolve,2500));const response=await fetch('/api/jobs/'+j.id);if(!response.ok)throw Error('查詢任務失敗');state=await response.json();progress.value=state.progress||0;result.textContent=`狀態：${state.status}（${state.progress||0}%）`;}if(state.status==='failed')throw Error(state.error||'處理失敗');progress.value=100;result.textContent=`完成！截圖 ${state.frames} 張，逐字稿 ${state.cues} 段。${state.has_subtitles?'':'\n注意：此影片沒有可取得的字幕。'}${(state.warnings||[]).map(w=>'\n注意：'+w).join('')}`;download.href='/api/jobs/'+j.id+'/download';download.style.display='inline-block';}catch(err){result.textContent='錯誤：'+err.message;}finally{start.disabled=false;}});
+:root{--paper:#f2f6f5;--ink:#23343b;--muted:#677a82;--line:#d5e1de;--teal:#2a7a72;--teal-deep:#1d5c56;--wash:#eaf4f1;--chosen:#d3ebe5;--error:#b5524b;--chevron:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 -960 960 960'%3E%3Cpath fill='%232a7a72' d='M480-344 240-584l56-56 184 184 184-184 56 56-240 240Z'/%3E%3C/svg%3E");font-family:system-ui,'Noto Sans TC',sans-serif;color:var(--ink);background:var(--paper)}
+*{box-sizing:border-box}main{max-width:800px;margin:5vh auto;padding:24px}header{margin-bottom:24px}h1{font-size:clamp(26px,4vw,38px);letter-spacing:-1px}p{color:var(--muted);line-height:1.7}
+.panel{background:white;padding:28px;border-radius:22px;box-shadow:0 12px 50px #19334b0c}
+label{display:block;font-weight:650;margin:18px 0 8px}
+input,select{width:100%;padding:14px;border:1px solid var(--line);border-radius:10px;font:inherit;color:inherit;background:white;transition:border-color .15s,box-shadow .15s}
+input:hover,select:hover{border-color:#a9c9c2}
+input:focus-visible,select:focus-visible{outline:none;border-color:var(--teal);box-shadow:0 0 0 3px var(--chosen)}
+input[type=checkbox]{width:auto;accent-color:var(--teal);cursor:pointer}
+.check{display:flex;align-items:center;gap:8px;cursor:pointer}
+select{appearance:none;cursor:pointer;padding-right:40px;background:white var(--chevron) no-repeat right 12px center}
+/* Customizable select (Chrome/Edge 135+); other browsers keep the styled closed select above. */
+@supports (appearance:base-select){
+select,::picker(select){appearance:base-select}
+select{background-image:none;padding-right:14px}
+/* Material Symbols keyboard_arrow_down; rotates to point up while open. */
+select::picker-icon{content:var(--chevron);height:20px;transition:rotate .2s}
+select:open::picker-icon{rotate:180deg}
+::picker(select){border:1px solid var(--line);border-radius:12px;padding:6px;margin-top:6px;background:white;box-shadow:0 14px 40px #19334b17;opacity:0;translate:0 -4px;transition:opacity .16s,translate .16s,display .16s allow-discrete,overlay .16s allow-discrete}
+select:open::picker(select){opacity:1;translate:0 0}
+@starting-style{select:open::picker(select){opacity:0;translate:0 -4px}}
+option{padding:10px 12px;border-radius:8px;cursor:pointer;transition:background .12s,color .12s}
+option:hover,option:focus-visible{background:var(--wash);outline:none}
+option:checked{background:var(--chosen);color:var(--teal-deep);font-weight:600}
+option::checkmark{color:var(--teal)}
+}
+button,a.action{display:inline-block;border:0;border-radius:11px;background:var(--teal);color:white;padding:13px 22px;font:inherit;cursor:pointer;text-decoration:none;margin-top:18px;transition:background .15s,translate .15s,box-shadow .15s}
+button:hover:not(:disabled),a.action:hover{background:var(--teal-deep);translate:0 -1px;box-shadow:0 6px 18px #1d5c5626}
+button:focus-visible,a.action:focus-visible{outline:3px solid var(--chosen);outline-offset:2px}
+button:disabled{opacity:.5;cursor:not-allowed}
+.row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:160px}small{color:#718096}
+#job{margin-top:24px}.job-head{display:flex;justify-content:space-between;gap:12px;margin-bottom:10px;font-weight:600}#percent{color:var(--teal);font-variant-numeric:tabular-nums}
+/* Progress drawn as a video timeline with a playhead. */
+.bar{position:relative;height:8px;border-radius:99px;background:var(--wash)}
+.fill{position:relative;height:100%;width:0;border-radius:inherit;background:linear-gradient(100deg,transparent 20%,#ffffff8c 50%,transparent 80%) -100% 0/50% 100% no-repeat,linear-gradient(90deg,#8ccabe,var(--teal));animation:sweep 1.8s linear infinite}
+.fill::after{content:'';position:absolute;right:-7px;top:50%;width:14px;height:14px;translate:0 -50%;border-radius:50%;background:white;border:3px solid var(--teal);box-shadow:0 0 0 4px #2a7a7222}
+.bar.done .fill{animation:none}
+.bar.failed .fill{animation:none;background:#e4a9a2}.bar.failed .fill::after{border-color:var(--error)}
+@keyframes sweep{to{background-position:200% 0,0 0}}
+@media (prefers-reduced-motion:reduce){.fill{animation:none}*{transition:none!important}}
+#result{white-space:pre-wrap;line-height:1.7;margin-top:16px}#result.error{color:var(--error)}
+#download{display:none}footer{margin-top:20px;font-size:13px;color:var(--muted)}
+</style></head><body><main><header><h1>Video Notes Extractor</h1><p>貼上 YouTube 影片網址，自動偵測畫面變化、對齊逐字稿，匯出 Markdown 圖文筆記。</p></header><section class="panel"><form id="form"><label for="url">影片網址</label><input id="url" type="url" required value="" placeholder="輸入 YT 網址..."><div class="row"><div><label for="threshold">場景偵測敏感度</label><input id="threshold" type="number" min="0.1" max="0.8" step="0.01" value="0.32"><small>數字越小越敏感；現在採用全片每 2 秒取樣與差異去重</small></div><div><label for="gap">最短截圖間隔（秒）</label><input id="gap" type="number" min="2" max="60" value="4"></div><div><label for="max">最多截圖張數</label><input id="max" type="number" min="1" max="300" value="300"></div></div><div class="row"><div><label class="check"><input id="summary" type="checkbox"> 產出摘要（summary.md）</label><select id="summary-language" aria-label="摘要語系"><option value="zh-TW">繁體中文</option><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div><div><label for="translate">翻譯語系</label><select id="translate"><option value="">不翻譯</option><option value="zh-TW">繁體中文</option><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div></div><small>摘要、翻譯，以及無章節影片的 AI 自動分章，需在伺服器設定 GEMINI_API_KEY</small><br><button id="start" type="submit">開始擷取</button></form><div id="job" hidden><div class="job-head"><span id="stage" aria-live="polite">準備中</span><span id="percent">0%</span></div><div id="bar" class="bar" role="progressbar" aria-label="處理進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="fill" id="fill"></div></div></div><div id="result" role="status" aria-live="polite"></div><a class="action" id="download">下載 ZIP</a></section><footer>個人使用 MVP。請勿公開部署未設身分驗證的服務；僅處理有權存取及保存的影片。</footer></main><script>
+const $=id=>document.getElementById(id),form=$('form'),result=$('result'),start=$('start'),download=$('download'),job=$('job'),bar=$('bar'),fill=$('fill'),stage=$('stage'),percent=$('percent');
+const STAGES={queued:'排隊中',downloading:'下載影片與字幕',analyzing:'分析畫面變化',chaptering:'AI 自動分章',ai:'產生摘要與翻譯',done:'完成',failed:'處理失敗'};
+// Server progress only moves at stage changes; between polls, ease toward just below the next stage.
+const NEXT={queued:10,downloading:50,analyzing:75,chaptering:85,ai:100};
+let shown=0,floor=0,ceiling=0,last=0,frame=0;
+function render(value){fill.style.width=value+'%';percent.textContent=Math.floor(value)+'%';bar.setAttribute('aria-valuenow',Math.floor(value));}
+function tick(now){const dt=last?(now-last)/1000:0;last=now;
+  if(shown<floor)shown+=(floor-shown)*(1-Math.exp(-dt/0.4));   // catch up quickly after a stage jump
+  else shown+=(ceiling-shown)*(1-Math.exp(-dt/25));            // creep, slowing as it nears the ceiling
+  render(shown);frame=requestAnimationFrame(tick);}
+function track(state){stage.textContent=STAGES[state.status]||state.status;floor=state.progress||0;ceiling=Math.max(floor,(NEXT[state.status]||floor)-1);}
+function stop(status){cancelAnimationFrame(frame);bar.classList.add(status);stage.textContent=STAGES[status];if(status==='done')render(100);}
+form.addEventListener('submit',async e=>{e.preventDefault();start.disabled=true;download.style.display='none';result.textContent='';result.className='';
+  job.hidden=false;bar.className='bar';shown=floor=ceiling=last=0;render(0);cancelAnimationFrame(frame);frame=requestAnimationFrame(tick);stage.textContent='建立任務中';
+  try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value,threshold:Number($('threshold').value),min_gap:Number($('gap').value),max_frames:Number($('max').value),summary:$('summary').checked,summary_language:$('summary-language').value,translate:$('translate').value})});
+    const j=await r.json();if(!r.ok)throw Error(j.detail||'無法建立任務');let state=j;track(state);
+    while(!['done','failed'].includes(state.status)){await new Promise(resolve=>setTimeout(resolve,2500));const response=await fetch('/api/jobs/'+j.id);if(!response.ok)throw Error('查詢任務失敗');state=await response.json();track(state);}
+    if(state.status==='failed')throw Error(state.error||'處理失敗');
+    stop('done');result.textContent=`截圖 ${state.frames} 張，逐字稿 ${state.cues} 段。${state.has_subtitles?'':'\n注意：此影片沒有可取得的字幕。'}${(state.warnings||[]).map(w=>'\n注意：'+w).join('')}`;download.href='/api/jobs/'+j.id+'/download';download.style.display='inline-block';
+  }catch(err){stop('failed');result.className='error';result.textContent='錯誤：'+err.message;}finally{start.disabled=false;}});
 </script></body></html>
