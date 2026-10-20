@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from app import gemini
 from app.notes import render_notes
 
 ROOT = Path(os.getenv('DATA_DIR', '/srv/data')).resolve()
@@ -29,6 +30,9 @@ class JobRequest(BaseModel):
     threshold: float = 0.32
     min_gap: int = 4
     max_frames: int = 120
+    summary: bool = False
+    summary_language: str = 'zh-TW'
+    translate: str = ''
 
 
 def video_id(url):
@@ -75,7 +79,7 @@ def update(jid, **changes):
         JOBS[jid].update(changes)
 
 
-def process(jid, url, threshold, min_gap, max_frames):
+def process(jid, url, threshold, min_gap, max_frames, summary, summary_language, translate):
     folder = ROOT / jid
     folder.mkdir(exist_ok=True)
     shots = folder / 'screenshots'
@@ -168,19 +172,43 @@ def process(jid, url, threshold, min_gap, max_frames):
         shutil.rmtree(samples)
         update(jid, candidate_frames=original_count, sampled_frames=len(sampled))
         chapters = info.get('chapters') or []
+        warnings = []
+        if not chapters and cues and gemini.enabled():
+            update(jid, status='chaptering', progress=75)
+            try:
+                chapters = gemini.make_chapters(cues, info.get('duration') or cues[-1]['start'])
+            except Exception as e:
+                warnings.append(f'AI 分章失敗，改用單一章節：{e}'[:300])
         markdown = render_notes(info.get('title', '影片筆記'), url, chapters, frames, cues,
                                 sample_step, original_count)
         (folder/'README.md').write_text(markdown, encoding='utf-8')
         (folder/'transcript.json').write_text(json.dumps(cues,ensure_ascii=False,indent=2),encoding='utf-8')
         (folder/'chapters.json').write_text(json.dumps(chapters,ensure_ascii=False,indent=2),encoding='utf-8')
         (folder/'frames.json').write_text(json.dumps(frames,ensure_ascii=False,indent=2),encoding='utf-8')
+        extras = []
+        if summary or translate:
+            update(jid, status='ai', progress=85)
+        # AI outputs are optional extras: a failure here must not lose the base notes.
+        if summary:
+            try:
+                (folder/'summary.md').write_text(gemini.summarize(markdown, gemini.LANGUAGES[summary_language]), encoding='utf-8')
+                extras.append('summary.md')
+            except Exception as e:
+                warnings.append(f'AI 摘要失敗：{e}'[:300])
+        if translate:
+            translated, failed = gemini.translate(markdown, gemini.LANGUAGES[translate])
+            # Safe as a filename: translate is an allowlisted code.
+            (folder/f'README.{translate}.md').write_text(translated, encoding='utf-8')
+            extras.append(f'README.{translate}.md')
+            if failed:
+                warnings.append(f'有 {failed} 段翻譯失敗，已保留原文並標註')
         with zipfile.ZipFile(folder/'result.zip','w',zipfile.ZIP_DEFLATED) as z:
-            for name in ['README.md','transcript.json','chapters.json','frames.json']:
+            for name in ['README.md','transcript.json','chapters.json','frames.json', *extras]:
                 z.write(folder/name,name)
             for p in shots.glob('*.jpg'):
                 z.write(p,p.relative_to(folder))
         video.unlink(missing_ok=True)
-        update(jid,status='done',progress=100,frames=len(frames),cues=len(cues),has_subtitles=bool(cues))
+        update(jid,status='done',progress=100,frames=len(frames),cues=len(cues),has_subtitles=bool(cues),warnings=warnings)
     except Exception as e:
         update(jid,status='failed',error=str(e)[:800])
 
@@ -196,12 +224,16 @@ def create_job(req: JobRequest):
         raise HTTPException(400,str(e))
     if not (0.1 <= req.threshold <= 0.8 and 2 <= req.min_gap <= 60 and 1 <= req.max_frames <= 300):
         raise HTTPException(400,'參數超出允許範圍')
+    if req.summary_language not in gemini.LANGUAGES or req.translate not in ('', *gemini.LANGUAGES):
+        raise HTTPException(400,'不支援的語系')
+    if (req.summary or req.translate) and not gemini.enabled():
+        raise HTTPException(400,'未設定 GEMINI_API_KEY，無法摘要或翻譯')
     with LOCK:
         if sum(j['status'] not in ('done','failed') for j in JOBS.values()) >= 1:
             raise HTTPException(429,'已有任務進行中，請稍後再試')
         jid = uuid.uuid4().hex
         JOBS[jid] = {'id':jid,'status':'queued','progress':0,'video_id':vid}
-    thread = threading.Thread(target=process,args=(jid,req.url,req.threshold,req.min_gap,req.max_frames),daemon=True)
+    thread = threading.Thread(target=process,args=(jid,req.url,req.threshold,req.min_gap,req.max_frames,req.summary,req.summary_language,req.translate),daemon=True)
     thread.start()
     return JOBS[jid]
 
