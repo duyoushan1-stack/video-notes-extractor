@@ -237,6 +237,15 @@ def create_job(req: JobRequest):
     thread.start()
     return JOBS[jid]
 
+# Declared before /api/jobs/{jid} so 'active' is not taken as a job id.
+@app.get('/api/jobs/active')
+def active_job():
+    with LOCK:
+        running = [j for j in JOBS.values() if j['status'] not in ('done','failed')]
+    if not running:
+        raise HTTPException(404,'沒有進行中的任務')
+    return running[0]
+
 @app.get('/api/jobs/{jid}')
 def get_job(jid: str):
     if jid not in JOBS:

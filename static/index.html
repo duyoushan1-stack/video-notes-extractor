@@ -30,14 +30,10 @@ button:focus-visible,a.action:focus-visible{outline:3px solid var(--chosen);outl
 button:disabled{opacity:.5;cursor:not-allowed}
 .row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:160px}small{color:#718096}
 #job{margin-top:24px}.job-head{display:flex;justify-content:space-between;gap:12px;margin-bottom:10px;font-weight:600}#percent{color:var(--teal);font-variant-numeric:tabular-nums}
-/* Progress drawn as a video timeline with a playhead. */
-.bar{position:relative;height:8px;border-radius:99px;background:var(--wash)}
-.fill{position:relative;height:100%;width:0;border-radius:inherit;background:linear-gradient(100deg,transparent 20%,#ffffff8c 50%,transparent 80%) -100% 0/50% 100% no-repeat,linear-gradient(90deg,#8ccabe,var(--teal));animation:sweep 1.8s linear infinite}
-.fill::after{content:'';position:absolute;right:-7px;top:50%;width:14px;height:14px;translate:0 -50%;border-radius:50%;background:white;border:3px solid var(--teal);box-shadow:0 0 0 4px #2a7a7222}
-.bar.done .fill{animation:none}
-.bar.failed .fill{animation:none;background:#e4a9a2}.bar.failed .fill::after{border-color:var(--error)}
-@keyframes sweep{to{background-position:200% 0,0 0}}
-@media (prefers-reduced-motion:reduce){.fill{animation:none}*{transition:none!important}}
+.bar{height:8px;border-radius:99px;background:var(--wash)}
+.fill{height:100%;width:0;border-radius:inherit;background:linear-gradient(90deg,#8ccabe,var(--teal))}
+.bar.failed .fill{background:#e4a9a2}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 #result{white-space:pre-wrap;line-height:1.7;margin-top:16px}#result.error{color:var(--error)}
 #download{display:none}footer{margin-top:20px;font-size:13px;color:var(--muted)}
 </style></head><body><main><header><h1>Video Notes Extractor</h1><p>貼上 YouTube 影片網址，自動偵測畫面變化、對齊逐字稿，匯出 Markdown 圖文筆記。</p></header><section class="panel"><form id="form"><label for="url">影片網址</label><input id="url" type="url" required value="" placeholder="輸入 YT 網址..."><div class="row"><div><label for="threshold">場景偵測敏感度</label><input id="threshold" type="number" min="0.1" max="0.8" step="0.01" value="0.32"><small>數字越小越敏感；現在採用全片每 2 秒取樣與差異去重</small></div><div><label for="gap">最短截圖間隔（秒）</label><input id="gap" type="number" min="2" max="60" value="4"></div><div><label for="max">最多截圖張數</label><input id="max" type="number" min="1" max="300" value="300"></div></div><div class="row"><div><label class="check"><input id="summary" type="checkbox"> 產出摘要（summary.md）</label><select id="summary-language" aria-label="摘要語系"><option value="zh-TW">繁體中文</option><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div><div><label for="translate">翻譯語系</label><select id="translate"><option value="">不翻譯</option><option value="zh-TW">繁體中文</option><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div></div><small>摘要、翻譯，以及無章節影片的 AI 自動分章，需在伺服器設定 GEMINI_API_KEY</small><br><button id="start" type="submit">開始擷取</button></form><div id="job" hidden><div class="job-head"><span id="stage" aria-live="polite">準備中</span><span id="percent">0%</span></div><div id="bar" class="bar" role="progressbar" aria-label="處理進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="fill" id="fill"></div></div></div><div id="result" role="status" aria-live="polite"></div><a class="action" id="download">下載 ZIP</a></section><footer>個人使用 MVP。請勿公開部署未設身分驗證的服務；僅處理有權存取及保存的影片。</footer></main><script>
@@ -53,12 +49,17 @@ function tick(now){const dt=last?(now-last)/1000:0;last=now;
   render(shown);frame=requestAnimationFrame(tick);}
 function track(state){stage.textContent=STAGES[state.status]||state.status;floor=state.progress||0;ceiling=Math.max(floor,(NEXT[state.status]||floor)-1);}
 function stop(status){cancelAnimationFrame(frame);bar.classList.add(status);stage.textContent=STAGES[status];if(status==='done')render(100);}
-form.addEventListener('submit',async e=>{e.preventDefault();start.disabled=true;download.style.display='none';result.textContent='';result.className='';
-  job.hidden=false;bar.className='bar';shown=floor=ceiling=last=0;render(0);cancelAnimationFrame(frame);frame=requestAnimationFrame(tick);stage.textContent='建立任務中';
-  try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value,threshold:Number($('threshold').value),min_gap:Number($('gap').value),max_frames:Number($('max').value),summary:$('summary').checked,summary_language:$('summary-language').value,translate:$('translate').value})});
-    const j=await r.json();if(!r.ok)throw Error(j.detail||'無法建立任務');let state=j;track(state);
-    while(!['done','failed'].includes(state.status)){await new Promise(resolve=>setTimeout(resolve,2500));const response=await fetch('/api/jobs/'+j.id);if(!response.ok)throw Error('查詢任務失敗');state=await response.json();track(state);}
+function begin(text){start.disabled=true;download.style.display='none';result.textContent='';result.className='';
+  job.hidden=false;bar.className='bar';shown=floor=ceiling=last=0;render(0);cancelAnimationFrame(frame);frame=requestAnimationFrame(tick);stage.textContent=text;}
+async function follow(request){
+  try{let state=await request();track(state);
+    while(!['done','failed'].includes(state.status)){await new Promise(resolve=>setTimeout(resolve,2500));const response=await fetch('/api/jobs/'+state.id);if(!response.ok)throw Error('查詢任務失敗');state=await response.json();track(state);}
     if(state.status==='failed')throw Error(state.error||'處理失敗');
-    stop('done');result.textContent=`截圖 ${state.frames} 張，逐字稿 ${state.cues} 段。${state.has_subtitles?'':'\n注意：此影片沒有可取得的字幕。'}${(state.warnings||[]).map(w=>'\n注意：'+w).join('')}`;download.href='/api/jobs/'+j.id+'/download';download.style.display='inline-block';
-  }catch(err){stop('failed');result.className='error';result.textContent='錯誤：'+err.message;}finally{start.disabled=false;}});
+    stop('done');result.textContent=`截圖 ${state.frames} 張，逐字稿 ${state.cues} 段。${state.has_subtitles?'':'\n注意：此影片沒有可取得的字幕。'}${(state.warnings||[]).map(w=>'\n注意：'+w).join('')}`;download.href='/api/jobs/'+state.id+'/download';download.style.display='inline-block';
+  }catch(err){stop('failed');result.className='error';result.textContent='錯誤：'+err.message;}finally{start.disabled=false;}}
+form.addEventListener('submit',e=>{e.preventDefault();begin('建立任務中');follow(async()=>{
+  const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value,threshold:Number($('threshold').value),min_gap:Number($('gap').value),max_frames:Number($('max').value),summary:$('summary').checked,summary_language:$('summary-language').value,translate:$('translate').value})});
+  const j=await r.json();if(!r.ok)throw Error(j.detail||'無法建立任務');return j;});});
+// Reattach after a page reload: the server keeps running the job even when the page is gone.
+fetch('/api/jobs/active').then(r=>r.ok&&r.json()).then(state=>{if(state){begin('接續進行中的任務');follow(async()=>state);}}).catch(()=>{});
 </script></body></html>
