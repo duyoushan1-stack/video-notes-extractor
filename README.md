@@ -1,16 +1,16 @@
 # Video Notes Extractor MVP
 
-以瀏覽器提交 YouTube URL 或上傳 MP4，Docker 容器執行 yt-dlp + FFmpeg，擷取場景切換截圖、可用字幕與章節，輸出圖文 Markdown ZIP。
+以瀏覽器提交 YouTube／Google Vids 網址或上傳 MP4，Docker 容器執行 yt-dlp + FFmpeg，擷取場景切換截圖、逐字稿與章節，輸出圖文 Markdown ZIP。
 
 ## MP4 上傳與語音轉錄
 
 在「影片來源」選擇「上傳 MP4」，選擇檔案後使用相同的敏感度、最短截圖間隔與截圖張數設定。畫面顯示檔名與大小；按下開始後請保持頁面開啟直到上傳完成，背景處理開始後可重新整理接回任務。
 
-MP4 有音軌時會自動以 Gemini 產生原語言、帶時間戳的逐字稿，並沿用 AI 分章與選用摘要／翻譯。**音訊會傳送至 Gemini，使用你的 API 額度**；即使不勾摘要，仍須設定 `GEMINI_API_KEY`。Google Vids 由 [issue #5](https://github.com/duyoushan1-stack/video-notes-extractor/issues/5) 加入。
+MP4／Google Vids 有音軌時會自動以 Gemini 產生原語言、帶時間戳的逐字稿，並沿用 AI 分章與選用摘要／翻譯。**音訊會傳送至 Gemini，使用你的 API 額度**；即使不勾摘要，仍須設定 `GEMINI_API_KEY`。
 
 音訊轉為單聲道 16 kHz、64 kbps MP3，每 300 秒不重疊切段，以 inline audio 提交；不使用 Files API。逐字稿合併回原影片秒數。任一片段失敗仍保留成功內容，介面、README、摘要與翻譯開頭都標註不完整及缺漏時間；無音軌、無語音或全部轉錄失敗時仍產生圖片筆記，略過文字 AI。`source.json` 記錄 `transcript_source`、`transcript_status` 與警告。時間戳為模型估計，不保證字級或影格級精準。
 
-`complete` 表示所有片段的請求與格式驗證成功，不代表逐字內容已人工核對。真實 `gemini-3.8-flash` 驗收曾省略長靜音之後的重複語句；重要內容應對照原片，詳見 [issue #4 驗收紀錄](docs/implementation/issue-4.md)。
+`complete` 表示所有片段的請求與格式驗證成功，不代表逐字內容已人工核對。真實 `gemini-3.8-flash` 驗收曾省略長靜音之後的重複語句；重要內容應對照原片。
 
 - 接受單一真實 MP4 視訊，上限 **1,500,000,000 bytes**；不僅依副檔名或 MIME 判斷，會用 FFprobe 驗證容器、視訊軌與片長。
 - 上傳與處理共用單一名額，忙碌時回 429；接收的實際大小超量回 413，媒體無效回 415，60 秒未收到新資料回 408。
@@ -18,6 +18,25 @@ MP4 有音軌時會自動以 Gemini 產生原語言、帶時間戳的逐字稿�
 - 任務綁定目前瀏覽器的 HttpOnly cookie；重新整理可接續，其他瀏覽器／清除 cookie 後無法查詢舊任務。這是個人服務隔離，仍須維持 localhost 或既有受保護的部署方式。
 
 API：`POST /api/jobs/upload` 使用 multipart，單一 `file` 與 `threshold`、`min_gap`、`max_frames`、`summary`、`summary_language`、`translate` 表單欄位，成功回 202 與 job snapshot。原本 `POST /api/jobs` JSON 回 200 並保持 YouTube 預設行為。API 用戶須保存並在輪詢、預覽、下載時帶回 cookie（例如 curl 的 `-c cookies.txt`／`-b cookies.txt`）。
+
+## Google Vids 與 OAuth 設定
+
+1. 在 Google Cloud 建立專案並啟用 **Google Drive API**。
+2. 設定 Google Auth Platform／OAuth consent：設定應用程式名稱、聯絡資訊及 audience。個人測試選 External／Testing，將實際授權的 Google 帳號加入測試使用者；Workspace 內部應用程式可依組織政策設定 Internal。
+3. 在 Data Access 加入 `https://www.googleapis.com/auth/drive.readonly`。這是可讀取 Drive 檔案內容的廣泛唯讀 scope，用來存取你貼上的既有 Vids；不是只允許此應用程式建立的檔案。對外發布可能需要 Google 驗證，工作區管理員也可能禁止授權或下載。
+4. 建立 **Web application** OAuth client，加入完全一致的 Authorized redirect URI：`http://localhost:8000/api/google/callback`。瀏覽器也應使用 `http://localhost:8000`，不可在授權中途切換到 `127.0.0.1`。遠端部署必須使用 HTTPS，反向代理需保留可信的外部 scheme／host。
+5. 將 `.env.example` 複製為 `.env`（保留已有 Gemini 設定），填入自己的 `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET` 與 `GOOGLE_REDIRECT_URI`。範例僅有 placeholder，請勿把真實金鑰提交到 Git。執行 `docker compose up --build -d`。
+6. 選擇「Google Vids 網址」並按「連接 Google」，同意 Drive 唯讀權限後會回到固定首頁。重新選擇 Vids，貼上 `https://docs.google.com/videos/d/{id}/edit` 再開始。其他參數、摘要、翻譯、進度、重新整理接回與 ZIP 沿用 MP4 流程。
+
+OAuth 使用 state（10 分鐘、一次性）、PKCE 與 HttpOnly owner cookie。access／refresh token 只留伺服器記憶體，不進 JOBS、ZIP 或 token 檔案；**服務重啟後必須重新連接 Google**。過期時會更新 token，更新失敗清除連線。授權 callback 的查詢參數會在應用程式交給 Uvicorn 前移除，反向代理也應避免記錄 callback query。
+
+「斷開 Google」會清除本地連線並撤銷 Google grant；進行中的 Vids 任務須先完成，否則回 409。撤銷服務失敗時本地仍會斷線，頁面提醒至 Google 帳號的第三方連線手動移除授權。API 的 `POST /api/google/disconnect` 必須帶符合服務網址的 `Origin`。
+
+只接受 Google Vids MIME 與允許下載的檔案。依[官方長時間下載文件](https://developers.google.com/workspace/drive/api/guides/long-running-operations)使用 `files.download?mimeType=video/mp4`，每 5 秒輪詢、匯出與下載共用 30 分鐘期限，下載上限 1.5 GB。串流使用絕對期限中斷 socket，避免慢速回應長期占住任務。只向固定 Drive API origin 傳 Bearer；Google 回傳的 Google content URI 以無憑證獨立連線取得，禁止自動 redirect。官方文件未保證所有下載 URI 的主機與認證形式，因此遇未支援主機、需額外認證或跳轉會明確失敗，不能視為真實 Vids 相容性已驗證。
+
+API：`GET /api/google/status` 只回 `configured`／`connected`；`GET /api/google/connect` 開始授權；callback URI 固定為 `/api/google/callback`。建立任務使用 `POST /api/jobs` JSON `{"source":"google_vids","url":"https://docs.google.com/videos/d/FILE_ID/edit"}`，其他欄位與 YouTube 相同。未設定 OAuth 回 503、未連線回 401、缺 Gemini key 回 400；背景 403／404 顯示「無法存取影片或沒有下載權限」。Vids 筆記保留原始來源連結與純文字時間戳，不使用 YouTube 跳時參數。
+
+若組織政策、分享權限或下載位置阻擋，請由有權限的帳號在 Vids 手動匯出 MP4，再使用「上傳 MP4」。這個服務不繞過分享／組織限制，也不沿用 ChatGPT 的 Google 連接憑證。實際 Google OAuth 與有權限／無權限帳號的 Vids 流程仍待真實服務驗收。
 
 ## 啟動
 
@@ -60,7 +79,7 @@ NotebookLM 沒有公開的個人版 API；直接把 `README.md` 上傳成 Notebo
 
 ## MVP 限制
 
-- 不公開影片只在伺服器可直接存取時能下載；不支援登入 Cookie 或私人影片授權。
+- YouTube 不公開影片只在伺服器可直接存取時能下載；不支援 YouTube 登入 Cookie。Google Vids 另使用上述 OAuth 授權。
 - YouTube 依賴既有字幕，不會自動語音辨識；MP4 自動轉錄，沒有可用逐字稿時仍可產出截圖。
 - 畫面變化偵測使用 全片每 2 秒取樣 + Pillow 亮度/清晰度過濾 + 影格差異去重，並非投影片 OCR/語意辨識。短於取樣間隔的投影片仍可能漏抓，長時間存在的網址列等遮擋仍可能誤留。超出張數上限時，會跨全片均勻選取，不會只留下前半段。
 - 逐字稿按畫面區間配對；無畫面變化的長段落仍保留於完整逐字稿。
