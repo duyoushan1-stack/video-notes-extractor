@@ -98,6 +98,6 @@ def render_notes(title: str, url: str, chapters: list[Chapter], frames: list[Fra
         if not section_frames:
             lines += paragraphs([cue for cue in cues if start <= cue['start'] < end])
     if not cues:
-        lines += ['沒有可用逐字稿；此版本尚未對 MP4 執行語音轉錄。' if source == 'mp4'
+        lines += ['沒有可用逐字稿；請參閱上方警告。' if source != 'youtube'
                   else '無可用字幕；未執行語音轉錄。', '']
     return '\n'.join(lines).rstrip() + '\n'
