@@ -12,10 +12,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
-from app import gemini
+from app import gemini, google_vids
 from app.media import probe_video, audio_chunks
 from app.notes import render_notes, timestamp as format_time
 from app.uploads import receive_upload, run_upload_io
@@ -27,7 +27,8 @@ app.mount('/static', StaticFiles(directory='static'), name='static')
 # Single-process MVP state; use persistent queue and auth before public deployment.
 JOBS = {}
 OWNERS = {}
-LOCK = threading.Lock()
+GOOGLE_DISCONNECTING = set()
+LOCK = threading.RLock()
 MAX_UPLOAD_BYTES = 1_500_000_000
 MAX_REQUEST_OVERHEAD = 1024 * 1024
 UPLOAD_IDLE_SECONDS = 60
@@ -35,11 +36,18 @@ UPLOAD_IDLE_SECONDS = 60
 
 @app.middleware('http')
 async def browser_owner(request: Request, call_next):
+    if request.url.path == '/api/google/callback':
+        request.state.oauth_query = request.query_params
+        # Uvicorn logs scope query_string when sending response headers.
+        request.scope['query_string'] = b''
     owner = request.cookies.get('video_notes_owner', '')
     if not re.fullmatch(r'[a-f0-9]{32}', owner):
         owner = uuid.uuid4().hex
     request.state.owner = owner
     response = await call_next(request)
+    if request.url.path.startswith('/api/google/'):
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Referrer-Policy'] = 'no-referrer'
     response.set_cookie('video_notes_owner', owner, httponly=True, samesite='lax',
                         secure=request.url.scheme == 'https')
     return response
@@ -134,18 +142,29 @@ def owned_job(jid, request):
 
 
 def process(jid, url, threshold, min_gap, max_frames, summary, summary_language, translate,
-            video=None, info=None):
+            video=None, info=None, google_credentials=None):
     folder = ROOT / jid
     shots = folder / 'screenshots'
     failed = False
     warnings = []
+    failure_message = '影片處理失敗，請確認影片可讀取或稍後重試'
     try:
         folder.mkdir(exist_ok=True)
         shots.mkdir(exist_ok=True)
         source = JOBS[jid]['source']
         cues = []
         transcript_source, transcript_status = 'none', 'unavailable'
-        if video is None:
+        if source == 'google_vids':
+            update(jid, status='exporting', progress=5)
+            video = folder / 'video.mp4'
+            remote = google_vids.download_vids(google_vids.parse_vids_url(url), google_credentials, video)
+            update(jid, status='downloading', progress=10)
+            try:
+                info = probe_video(video)
+            except ValueError:
+                raise google_vids.GoogleVidsError('Google 取得的媒體無效，請改為手動匯出 MP4 上傳')
+            info['title'] = remote['title']
+        elif video is None:
             update(jid, status='downloading', progress=10)
             run(['yt-dlp','--no-playlist','--max-filesize','1500M','-f','bv*[height<=720]+ba/b[height<=720]/b',
              '--write-info-json','--write-subs','--write-auto-subs',
@@ -311,6 +330,9 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
                 z.write(folder/name,name)
             for p in shots.glob('*.jpg'):
                 z.write(p,p.relative_to(folder))
+    except google_vids.GoogleVidsError as exc:
+        failed = True
+        failure_message = str(exc)
     except Exception:
         failed = True
     finally:
@@ -335,7 +357,7 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
         if cleanup_failed:
             warnings.append('部分暫存檔清理失敗，請手動清理 data 目錄。')
         if failed:
-            update(jid, status='failed', error='影片處理失敗，請確認影片可讀取或稍後重試', warnings=warnings)
+            update(jid, status='failed', error=failure_message, warnings=warnings)
         else:
             update(jid,status='done',progress=100,frames=len(frames),cues=len(cues),has_subtitles=bool(cues),warnings=warnings)
 
@@ -345,20 +367,97 @@ def home():
 
 @app.post('/api/jobs')
 def create_job(req: JobRequest, request: Request):
-    if req.source != 'youtube':
-        raise HTTPException(400, '目前網址來源僅支援 YouTube')
+    if req.source not in ('youtube', 'google_vids'):
+        raise HTTPException(400, '不支援的影片來源')
+    if req.source == 'google_vids':
+        require_google()
     try:
-        vid = video_id(req.url)
+        vid = google_vids.parse_vids_url(req.url) if req.source == 'google_vids' else video_id(req.url)
     except ValueError as e:
         raise HTTPException(400,str(e))
     validate_options(req)
-    jid = reserve_job(request.state.owner, 'youtube', video_id=vid)
+    kwargs = {}
+    with LOCK:
+        if req.source == 'google_vids':
+            credentials = google_vids.CONNECTIONS.get(request.state.owner)
+            if credentials is None:
+                raise HTTPException(401, '請先連接 Google 帳號')
+            if not gemini.enabled():
+                raise HTTPException(400, '請先設定 GEMINI_API_KEY，再使用 Google Vids 功能')
+            kwargs['google_credentials'] = credentials
+        jid = reserve_job(request.state.owner, req.source, video_id=vid)
     try:
-        launch_job(jid, req)
+        launch_job(jid, req, **kwargs)
     except Exception:
         update(jid, status='failed', error='無法啟動影片任務')
         raise HTTPException(503, '無法啟動影片任務，請重試')
     return JOBS[jid].copy()
+
+
+def require_google():
+    if not google_vids.configured():
+        raise HTTPException(503, '尚未設定 Google OAuth，請設定後重新啟動服務')
+
+
+def google_busy(owner):
+    return owner in GOOGLE_DISCONNECTING or any(OWNERS.get(jid) == owner and job['source'] == 'google_vids'
+               and job['status'] not in ('done', 'failed') for jid, job in JOBS.items())
+
+
+@app.get('/api/google/status')
+def google_status(request: Request):
+    with google_vids.LOCK:
+        return {'configured': google_vids.configured(),
+                'connected': request.state.owner in google_vids.CONNECTIONS}
+
+
+@app.get('/api/google/connect')
+def google_connect(request: Request):
+    require_google()
+    with LOCK:
+        if google_busy(request.state.owner):
+            raise HTTPException(409, 'Google Vids 任務進行中，請完成後再變更連線')
+        return RedirectResponse(google_vids.start_connection(request.state.owner), status_code=303,
+                                headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+
+@app.get('/api/google/callback')
+def google_callback(request: Request):
+    require_google()
+    query = request.state.oauth_query
+    if any(len(query.getlist(key)) > 1 for key in ('state', 'code', 'error')):
+        raise HTTPException(400, 'Google 授權回覆格式無效，請重新連線')
+    with LOCK:
+        if google_busy(request.state.owner):
+            raise HTTPException(409, 'Google Vids 任務進行中，請完成後再變更連線')
+        try:
+            google_vids.finish_connection(request.state.owner, query.get('state', ''),
+                                         query.get('code', ''), query.get('error', ''))
+        except google_vids.GoogleVidsError as exc:
+            raise HTTPException(400, str(exc))
+    return RedirectResponse('/', status_code=303, headers={
+        'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+
+@app.post('/api/google/disconnect')
+def google_disconnect(request: Request):
+    if request.headers.get('origin') != str(request.base_url).rstrip('/'):
+        raise HTTPException(403, '請由本服務頁面斷開 Google 連線')
+    with LOCK, google_vids.LOCK:
+        if google_busy(request.state.owner):
+            raise HTTPException(409, 'Google Vids 任務進行中，請完成後再斷線')
+        google_vids.PENDING.pop(request.state.owner, None)
+        credentials = google_vids.CONNECTIONS.pop(request.state.owner, None)
+        GOOGLE_DISCONNECTING.add(request.state.owner)
+    try:
+        if credentials is not None:
+            google_vids.revoke(credentials)
+    except google_vids.GoogleVidsError as exc:
+        raise HTTPException(502, str(exc))
+    finally:
+        with LOCK:
+            GOOGLE_DISCONNECTING.discard(request.state.owner)
+    return {'configured': google_vids.configured(), 'connected': False}
 
 
 @app.post('/api/jobs/upload', status_code=202)
