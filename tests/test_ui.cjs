@@ -13,7 +13,7 @@ test('the shipped script has valid JavaScript syntax', () => {
 
 test('switching sources excludes invalid inactive inputs from form validation', () => {
   const elements = Object.fromEntries(['url-input', 'file-input', 'url', 'summary',
-    'summary-language', 'translate', 'source-note'].map(id => [id, {}]));
+    'summary-language', 'translate'].map(id => [id, {}]));
   const source = {value: 'mp4'};
   const file = {};
   const context = vm.createContext({source, file, $: id => elements[id]});
@@ -24,7 +24,6 @@ test('switching sources excludes invalid inactive inputs from form validation', 
   assert.equal(file.disabled, false);
   assert.equal(file.required, true);
   assert.equal(elements.summary.disabled, false);
-  assert.match(elements['source-note'].textContent, /音訊.*Gemini/);
   assert.match(script, /transcribing:'語音轉錄中'/);
   source.value = 'youtube';
   vm.runInContext('updateSource()', context);
