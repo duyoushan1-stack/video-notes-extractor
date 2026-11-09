@@ -83,7 +83,7 @@ class UploadTests(unittest.TestCase):
             self.assertIn('lecture.mp4', notes)
             self.assertIn('screenshots/frame-0001.jpg', notes)
             self.assertNotIn('?t=', notes)
-            self.assertIn('尚未', notes)
+            self.assertIn('沒有音軌', notes)
             source = json.loads(archive.read('source.json'))
             self.assertEqual(source['filename'], 'lecture.mp4')
             self.assertNotIn(str(self.root), json.dumps(source))
@@ -135,7 +135,7 @@ class UploadTests(unittest.TestCase):
         response = self.client.post('/api/jobs/upload', files={'threshold': (None, '0.3')})
         self.assertEqual(response.status_code, 400)
         for data in [{'threshold': 'NaN'}, {'max_frames': '301'}, {'translate': '../bad'},
-                     {'source': 'youtube'}, {'summary': 'true'}, {'threshold': 'abc'}]:
+                     {'source': 'youtube'}, {'threshold': 'abc'}]:
             response = self.upload(data=data)
             self.assertIn(response.status_code, (400, 422), response.text)
             self.assertEqual(list(self.root.iterdir()), [])

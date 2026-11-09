@@ -23,8 +23,10 @@ def main():
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
         env = dict(os.environ, DATA_DIR=str(root/'jobs'), GEMINI_API_KEY='smoke-test-placeholder')
-        server = subprocess.Popen([sys.executable, '-m', 'uvicorn', 'app.main:app',
-            '--host', '127.0.0.1', '--port', str(port)], env=env,
+        code = ('import uvicorn; from app import main; '
+                'main.gemini.transcribe_audio = lambda path, duration: []; '
+                f'uvicorn.run(main.app, host="127.0.0.1", port={port})')
+        server = subprocess.Popen([sys.executable, '-c', code], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             base = f'http://127.0.0.1:{port}'

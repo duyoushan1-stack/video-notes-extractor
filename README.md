@@ -2,11 +2,15 @@
 
 以瀏覽器提交 YouTube URL 或上傳 MP4，Docker 容器執行 yt-dlp + FFmpeg，擷取場景切換截圖、可用字幕與章節，輸出圖文 Markdown ZIP。
 
-## MP4 上傳（第一階段）
+## MP4 上傳與語音轉錄
 
 在「影片來源」選擇「上傳 MP4」，選擇檔案後使用相同的敏感度、最短截圖間隔與截圖張數設定。畫面顯示檔名與大小；按下開始後請保持頁面開啟直到上傳完成，背景處理開始後可重新整理接回任務。
 
-目前 MP4 **只產出圖片筆記與時間戳，尚未執行語音轉錄、摘要或翻譯**；這些功能由後續 [issue #4](https://github.com/duyoushan1-stack/video-notes-extractor/issues/4) 加入，Google Vids 則由 [issue #5](https://github.com/duyoushan1-stack/video-notes-extractor/issues/5) 加入。MP4 模式會停用摘要／翻譯，API 也會明確拒絕這些選項。依後續共用轉錄契約，上傳端點已要求伺服器設定 `GEMINI_API_KEY`，此階段 MP4 不會呼叫 Gemini 或傳送影片／音訊。
+MP4 有音軌時會自動以 Gemini 產生原語言、帶時間戳的逐字稿，並沿用 AI 分章與選用摘要／翻譯。**音訊會傳送至 Gemini，使用你的 API 額度**；即使不勾摘要，仍須設定 `GEMINI_API_KEY`。Google Vids 由 [issue #5](https://github.com/duyoushan1-stack/video-notes-extractor/issues/5) 加入。
+
+音訊轉為單聲道 16 kHz、64 kbps MP3，每 300 秒不重疊切段，以 inline audio 提交；不使用 Files API。逐字稿合併回原影片秒數。任一片段失敗仍保留成功內容，介面、README、摘要與翻譯開頭都標註不完整及缺漏時間；無音軌、無語音或全部轉錄失敗時仍產生圖片筆記，略過文字 AI。`source.json` 記錄 `transcript_source`、`transcript_status` 與警告。時間戳為模型估計，不保證字級或影格級精準。
+
+`complete` 表示所有片段的請求與格式驗證成功，不代表逐字內容已人工核對。真實 `gemini-3.8-flash` 驗收曾省略長靜音之後的重複語句；重要內容應對照原片，詳見 [issue #4 驗收紀錄](docs/implementation/issue-4.md)。
 
 - 接受單一真實 MP4 視訊，上限 **1,500,000,000 bytes**；不僅依副檔名或 MIME 判斷，會用 FFprobe 驗證容器、視訊軌與片長。
 - 上傳與處理共用單一名額，忙碌時回 429；接收的實際大小超量回 413，媒體無效回 415，60 秒未收到新資料回 408。
@@ -46,7 +50,7 @@ API：`POST /api/jobs/upload` 使用 multipart，單一 `file` 與 `threshold`�
 
 ```
 GEMINI_API_KEY=你的金鑰
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.8-flash
 ```
 
 未設定金鑰時，送出摘要或翻譯會被伺服器拒絕（400），其他功能照常。摘要語系與翻譯語系分開設定。
@@ -57,7 +61,7 @@ NotebookLM 沒有公開的個人版 API；直接把 `README.md` 上傳成 Notebo
 ## MVP 限制
 
 - 不公開影片只在伺服器可直接存取時能下載；不支援登入 Cookie 或私人影片授權。
-- YouTube 依賴既有字幕，不會自動語音辨識；MP4 本階段尚無語音轉錄，兩者缺字幕時仍可產出截圖。
+- YouTube 依賴既有字幕，不會自動語音辨識；MP4 自動轉錄，沒有可用逐字稿時仍可產出截圖。
 - 畫面變化偵測使用 全片每 2 秒取樣 + Pillow 亮度/清晰度過濾 + 影格差異去重，並非投影片 OCR/語意辨識。短於取樣間隔的投影片仍可能漏抓，長時間存在的網址列等遮擋仍可能誤留。超出張數上限時，會跨全片均勻選取，不會只留下前半段。
 - 逐字稿按畫面區間配對；無畫面變化的長段落仍保留於完整逐字稿。
 - 任務狀態只存在記憶體，重啟會遺失；下載結果存在 `data/`，需要定期手動清理。
@@ -85,6 +89,14 @@ docker run --rm --network none --mount "type=bind,source=$($PWD.Path)/app,target
 ```
 
 smoke script 以臨時伺服器和自動生成的有聲／無聲 MP4 驗證實際 HTTP、FFprobe、FFmpeg、ZIP 與清理，使用假金鑰且不呼叫 Gemini。若檔案受鎖定而清理失敗，任務仍結束並釋放名額，畫面會提醒手動清理 `data/`。
+
+`tests/smoke_transcription.py` 另驗證 310 秒有聲／無聲 MP4，預設只模擬 Gemini 傳輸層，仍執行實際音訊切段、回覆驗證、摘要／翻譯整合與 ZIP 清理：
+
+```powershell
+docker run --rm --network none --mount "type=bind,source=$($PWD.Path),target=/srv" --entrypoint python video-notes-extractor-extractor:latest tests/smoke_transcription.py
+```
+
+真實 API 驗收需移除 `--network none`、加入 `--env-file .env`，並傳入 `--live --speech /srv/path/to/speech.wav`。請提供短語音 WAV，腳本會在 2／152／302 秒放入語音，檢查三個位置是否都有轉錄；會傳送合成音訊並使用 API 額度。未通過時不可當作真實轉錄完整度已驗證。
 
 自動測試 mock 外部 yt-dlp／FFmpeg／Gemini，驗證串流大小、並行 admission、上傳中斷／逾時清理、來源隔離、圖片 ZIP、無效媒體與 YouTube 相容性。真實 MP4 的 FFmpeg 處理須另用 Docker 驗收；YouTube 真實下載仍可能受平台防機器人限制。
 

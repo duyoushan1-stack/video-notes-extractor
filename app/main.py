@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import shutil
@@ -15,8 +16,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 from app import gemini
-from app.media import probe_video
-from app.notes import render_notes
+from app.media import probe_video, audio_chunks
+from app.notes import render_notes, timestamp as format_time
 from app.uploads import receive_upload, run_upload_io
 
 ROOT = Path(os.getenv('DATA_DIR', '/srv/data')).resolve()
@@ -30,7 +31,6 @@ LOCK = threading.Lock()
 MAX_UPLOAD_BYTES = 1_500_000_000
 MAX_REQUEST_OVERHEAD = 1024 * 1024
 UPLOAD_IDLE_SECONDS = 60
-MP4_WARNING = '此版本 MP4 僅提供圖片筆記，尚未提供語音轉錄、摘要與翻譯。'
 
 
 @app.middleware('http')
@@ -144,7 +144,7 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
         shots.mkdir(exist_ok=True)
         source = JOBS[jid]['source']
         cues = []
-        warnings = [MP4_WARNING] if source == 'mp4' else []
+        transcript_source, transcript_status = 'none', 'unavailable'
         if video is None:
             update(jid, status='downloading', progress=10)
             run(['yt-dlp','--no-playlist','--max-filesize','1500M','-f','bv*[height<=720]+ba/b[height<=720]/b',
@@ -164,9 +164,43 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
             # Keep the current subtitle language priority.
             subs.sort(key=lambda p: ('.zh-' not in p.name.lower(), '.en' in p.name.lower(), len(p.name)))
             cues = parse_vtt(subs[0]) if subs else []
-        update(jid, title=info.get('title', '影片筆記'),
-               transcript_source='youtube_captions' if cues else 'none',
-               transcript_status='complete' if cues else 'unavailable', warnings=warnings)
+        if source == 'youtube':
+            transcript_source = 'youtube_captions' if cues else 'none'
+            transcript_status = 'complete' if cues else 'unavailable'
+        else:
+            if not info.get('has_audio'):
+                warnings.append('影片沒有音軌，沒有可用逐字稿；略過 AI 分章、摘要與翻譯。')
+            else:
+                update(jid, status='transcribing', progress=15, title=info.get('title', '影片筆記'))
+                failures = []
+                try:
+                    chunks = audio_chunks(video, folder)
+                except Exception:
+                    chunks = []
+                    warnings.append('音訊擷取失敗，沒有可用逐字稿；略過 AI 分章、摘要與翻譯。')
+                extracted_offsets = {offset for _, offset, _ in chunks}
+                for offset in range(0, math.ceil(info['duration']), 300):
+                    if offset not in extracted_offsets:
+                        failures.append(f'{format_time(offset)}–{format_time(min(offset + 300, info["duration"]))}')
+                for index, (path, offset, duration) in enumerate(chunks):
+                    try:
+                        relative = gemini.transcribe_audio(path, duration)
+                        cues.extend({'start': cue['start'] + offset, 'text': cue['text']} for cue in relative)
+                    except Exception:
+                        failures.append(f'{format_time(offset)}–{format_time(offset + duration)}')
+                    update(jid, progress=15 + int(30 * (index + 1) / len(chunks)))
+                cues.sort(key=lambda cue: cue['start'])
+                if cues:
+                    transcript_source = 'gemini'
+                    transcript_status = 'partial' if failures else 'complete'
+                if failures:
+                    warnings.append('來源逐字稿不完整；音訊擷取或轉錄失敗時間範圍：' + '、'.join(failures) + '。')
+                if not cues:
+                    warnings.append('沒有可用逐字稿（轉錄失敗或未偵測到語音）；略過 AI 分章、摘要與翻譯。')
+        update(jid, title=info.get('title', '影片筆記'), transcript_source=transcript_source,
+               transcript_status=transcript_status, warnings=warnings)
+        completeness = ('\n'.join('> ' + warning for warning in warnings) + '\n\n'
+                        if transcript_status == 'partial' else '')
         update(jid, status='analyzing', progress=50)
         # Sample the entire timeline rather than relying on FFmpeg's high scene threshold.
         # The sample index maps to source time (2s cadence, with the first at ~0s).
@@ -250,19 +284,20 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
         (folder/'chapters.json').write_text(json.dumps(chapters,ensure_ascii=False,indent=2),encoding='utf-8')
         (folder/'frames.json').write_text(json.dumps(frames,ensure_ascii=False,indent=2),encoding='utf-8')
         extras = []
-        if summary or translate:
+        text_ai = source == 'youtube' or bool(cues)
+        if text_ai and (summary or translate):
             update(jid, status='ai', progress=85)
         # AI outputs are optional extras: a failure here must not lose the base notes.
-        if summary:
+        if summary and text_ai:
             try:
-                (folder/'summary.md').write_text(gemini.summarize(markdown, gemini.LANGUAGES[summary_language]), encoding='utf-8')
+                (folder/'summary.md').write_text(completeness + gemini.summarize(markdown, gemini.LANGUAGES[summary_language]), encoding='utf-8')
                 extras.append('summary.md')
             except Exception as e:
                 warnings.append(f'AI 摘要失敗：{e}'[:300])
-        if translate:
+        if translate and text_ai:
             translated, failed_chapters = gemini.translate(markdown, gemini.LANGUAGES[translate])
             # Safe as a filename: translate is an allowlisted code.
-            (folder/f'README.{translate}.md').write_text(translated, encoding='utf-8')
+            (folder/f'README.{translate}.md').write_text(completeness + translated, encoding='utf-8')
             extras.append(f'README.{translate}.md')
             if failed_chapters:
                 warnings.append(f'有 {failed_chapters} 段翻譯失敗，已保留原文並標註')
@@ -291,11 +326,12 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
                 path.unlink(missing_ok=True)
             except OSError:
                 cleanup_failed = True
-        try:
-            if (folder/'samples').exists():
-                shutil.rmtree(folder/'samples')
-        except OSError:
-            cleanup_failed = True
+        for temporary in ('samples', 'audio'):
+            try:
+                if (folder/temporary).exists():
+                    shutil.rmtree(folder/temporary)
+            except OSError:
+                cleanup_failed = True
         if cleanup_failed:
             warnings.append('部分暫存檔清理失敗，請手動清理 data 目錄。')
         if failed:
@@ -343,14 +379,12 @@ async def upload_job(request: Request):
         except ValidationError:
             raise HTTPException(422, '處理參數格式錯誤')
         validate_options(req)
-        if req.summary or req.translate:
-            raise HTTPException(400, '此版本 MP4 尚未提供逐字稿、摘要與翻譯')
         try:
             metadata = await run_upload_io(probe_video, video)
         except ValueError as exc:
             raise HTTPException(415, str(exc))
         metadata['title'] = filename
-        update(jid, status='queued', title=filename, progress=10, warnings=[MP4_WARNING])
+        update(jid, status='queued', title=filename, progress=10, warnings=[])
         launch_job(jid, req, video=video, info=metadata)
         handed_off = True
         return JOBS[jid].copy()
