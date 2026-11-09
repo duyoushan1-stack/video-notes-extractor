@@ -10,12 +10,14 @@ from PIL import Image, ImageChops, ImageFilter, ImageStat
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from app import gemini
+from app.media import probe_video
 from app.notes import render_notes
+from app.uploads import receive_upload, run_upload_io
 
 ROOT = Path(os.getenv('DATA_DIR', '/srv/data')).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -23,10 +25,28 @@ app = FastAPI(title='Video Notes Extractor')
 app.mount('/static', StaticFiles(directory='static'), name='static')
 # Single-process MVP state; use persistent queue and auth before public deployment.
 JOBS = {}
+OWNERS = {}
 LOCK = threading.Lock()
+MAX_UPLOAD_BYTES = 1_500_000_000
+MAX_REQUEST_OVERHEAD = 1024 * 1024
+UPLOAD_IDLE_SECONDS = 60
+MP4_WARNING = '此版本 MP4 僅提供圖片筆記，尚未提供語音轉錄、摘要與翻譯。'
+
+
+@app.middleware('http')
+async def browser_owner(request: Request, call_next):
+    owner = request.cookies.get('video_notes_owner', '')
+    if not re.fullmatch(r'[a-f0-9]{32}', owner):
+        owner = uuid.uuid4().hex
+    request.state.owner = owner
+    response = await call_next(request)
+    response.set_cookie('video_notes_owner', owner, httponly=True, samesite='lax',
+                        secure=request.url.scheme == 'https')
+    return response
 
 class JobRequest(BaseModel):
     url: str
+    source: str = 'youtube'
     threshold: float = 0.32
     min_gap: int = 4
     max_frames: int = 120
@@ -79,30 +99,74 @@ def update(jid, **changes):
         JOBS[jid].update(changes)
 
 
-def process(jid, url, threshold, min_gap, max_frames, summary, summary_language, translate):
+def reserve_job(owner, source, status='queued', **values):
+    with LOCK:
+        if any(j['status'] not in ('done', 'failed') for j in JOBS.values()):
+            raise HTTPException(429, '已有任務進行中，請稍後再試')
+        jid = uuid.uuid4().hex
+        JOBS[jid] = {'id': jid, 'status': status, 'progress': 0, 'source': source,
+                     'title': '', 'transcript_source': 'none',
+                     'transcript_status': 'unavailable', 'warnings': [], **values}
+        OWNERS[jid] = owner
+    return jid
+
+
+def validate_options(req):
+    if not (0.1 <= req.threshold <= 0.8 and 2 <= req.min_gap <= 60 and 1 <= req.max_frames <= 300):
+        raise HTTPException(400, '參數超出允許範圍')
+    if req.summary_language not in gemini.LANGUAGES or req.translate not in ('', *gemini.LANGUAGES):
+        raise HTTPException(400, '不支援的語系')
+    if (req.summary or req.translate) and not gemini.enabled():
+        raise HTTPException(400, '未設定 GEMINI_API_KEY，無法摘要或翻譯')
+
+
+def launch_job(jid, req, **kwargs):
+    thread = threading.Thread(target=process, args=(jid, req.url, req.threshold, req.min_gap,
+        req.max_frames, req.summary, req.summary_language, req.translate), kwargs=kwargs, daemon=True)
+    thread.start()
+
+
+def owned_job(jid, request):
+    with LOCK:
+        if jid not in JOBS or OWNERS.get(jid) != request.state.owner:
+            raise HTTPException(404, '找不到任務')
+        return JOBS[jid].copy()
+
+
+def process(jid, url, threshold, min_gap, max_frames, summary, summary_language, translate,
+            video=None, info=None):
     folder = ROOT / jid
-    folder.mkdir(exist_ok=True)
     shots = folder / 'screenshots'
-    shots.mkdir(exist_ok=True)
+    failed = False
+    warnings = []
     try:
-        update(jid, status='downloading', progress=10)
-        run(['yt-dlp','--no-playlist','--max-filesize','1500M','-f','bv*[height<=720]+ba/b[height<=720]/b',
+        folder.mkdir(exist_ok=True)
+        shots.mkdir(exist_ok=True)
+        source = JOBS[jid]['source']
+        cues = []
+        warnings = [MP4_WARNING] if source == 'mp4' else []
+        if video is None:
+            update(jid, status='downloading', progress=10)
+            run(['yt-dlp','--no-playlist','--max-filesize','1500M','-f','bv*[height<=720]+ba/b[height<=720]/b',
              '--write-info-json','--write-subs','--write-auto-subs',
              '--sub-langs','zh-TW,zh-Hant,zh.*,en.*','--sub-format','vtt',
              '--ignore-errors','--retries','5','--sleep-subtitles','3',
-             '-o','video.%(ext)s',url],folder,5400)
-        info_files = list(folder.glob('*.info.json'))
-        if not info_files:
-            raise RuntimeError('無法取得影片資訊')
-        info = json.loads(info_files[0].read_text(encoding='utf-8'))
-        videos = [p for p in folder.glob('video.*') if p.suffix.lower() in ('.mp4','.webm','.mkv')]
-        if not videos:
-            raise RuntimeError('無法取得影片檔案')
-        video = videos[0]
-        subs = list(folder.glob('*.vtt'))
-        # Prefer manually authored subtitles, then automatic captions; language priority from download list.
-        subs.sort(key=lambda p: ('.zh-' not in p.name.lower(), '.en' in p.name.lower(), len(p.name)))
-        cues = parse_vtt(subs[0]) if subs else []
+                 '-o','video.%(ext)s',url],folder,5400)
+            info_files = list(folder.glob('*.info.json'))
+            if not info_files:
+                raise RuntimeError('無法取得影片資訊')
+            info = json.loads(info_files[0].read_text(encoding='utf-8'))
+            videos = [p for p in folder.glob('video.*') if p.suffix.lower() in ('.mp4','.webm','.mkv')]
+            if not videos:
+                raise RuntimeError('無法取得影片檔案')
+            video = videos[0]
+            subs = list(folder.glob('*.vtt'))
+            # Keep the current subtitle language priority.
+            subs.sort(key=lambda p: ('.zh-' not in p.name.lower(), '.en' in p.name.lower(), len(p.name)))
+            cues = parse_vtt(subs[0]) if subs else []
+        update(jid, title=info.get('title', '影片筆記'),
+               transcript_source='youtube_captions' if cues else 'none',
+               transcript_status='complete' if cues else 'unavailable', warnings=warnings)
         update(jid, status='analyzing', progress=50)
         # Sample the entire timeline rather than relying on FFmpeg's high scene threshold.
         # The sample index maps to source time (2s cadence, with the first at ~0s).
@@ -172,7 +236,6 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
         shutil.rmtree(samples)
         update(jid, candidate_frames=original_count, sampled_frames=len(sampled))
         chapters = info.get('chapters') or []
-        warnings = []
         if not chapters and cues and gemini.enabled():
             update(jid, status='chaptering', progress=75)
             try:
@@ -180,7 +243,8 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
             except Exception as e:
                 warnings.append(f'AI 分章失敗，改用單一章節：{e}'[:300])
         markdown = render_notes(info.get('title', '影片筆記'), url, chapters, frames, cues,
-                                sample_step, original_count)
+                                sample_step, original_count, source=source,
+                                warnings=warnings)
         (folder/'README.md').write_text(markdown, encoding='utf-8')
         (folder/'transcript.json').write_text(json.dumps(cues,ensure_ascii=False,indent=2),encoding='utf-8')
         (folder/'chapters.json').write_text(json.dumps(chapters,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -196,70 +260,137 @@ def process(jid, url, threshold, min_gap, max_frames, summary, summary_language,
             except Exception as e:
                 warnings.append(f'AI 摘要失敗：{e}'[:300])
         if translate:
-            translated, failed = gemini.translate(markdown, gemini.LANGUAGES[translate])
+            translated, failed_chapters = gemini.translate(markdown, gemini.LANGUAGES[translate])
             # Safe as a filename: translate is an allowlisted code.
             (folder/f'README.{translate}.md').write_text(translated, encoding='utf-8')
             extras.append(f'README.{translate}.md')
-            if failed:
-                warnings.append(f'有 {failed} 段翻譯失敗，已保留原文並標註')
+            if failed_chapters:
+                warnings.append(f'有 {failed_chapters} 段翻譯失敗，已保留原文並標註')
+        metadata = {key: JOBS[jid][key] for key in
+                    ('source', 'title', 'transcript_source', 'transcript_status')}
+        metadata.update(duration=info.get('duration'), warnings=warnings)
+        metadata['filename' if source == 'mp4' else 'url'] = info['title'] if source == 'mp4' else url
+        (folder/'source.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
         with zipfile.ZipFile(folder/'result.zip','w',zipfile.ZIP_DEFLATED) as z:
-            for name in ['README.md','transcript.json','chapters.json','frames.json', *extras]:
+            for name in ['README.md','transcript.json','chapters.json','frames.json','source.json', *extras]:
                 z.write(folder/name,name)
             for p in shots.glob('*.jpg'):
                 z.write(p,p.relative_to(folder))
-        video.unlink(missing_ok=True)
-        update(jid,status='done',progress=100,frames=len(frames),cues=len(cues),has_subtitles=bool(cues),warnings=warnings)
-    except Exception as e:
-        update(jid,status='failed',error=str(e)[:800])
+    except Exception:
+        failed = True
+    finally:
+        # Cleanup errors must not leave the single job slot occupied.
+        cleanup_failed = False
+        try:
+            raw_files = list(folder.glob('video.*'))
+        except OSError:
+            raw_files = []
+            cleanup_failed = True
+        for path in [*raw_files, *([folder/'result.zip'] if failed else [])]:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                cleanup_failed = True
+        try:
+            if (folder/'samples').exists():
+                shutil.rmtree(folder/'samples')
+        except OSError:
+            cleanup_failed = True
+        if cleanup_failed:
+            warnings.append('部分暫存檔清理失敗，請手動清理 data 目錄。')
+        if failed:
+            update(jid, status='failed', error='影片處理失敗，請確認影片可讀取或稍後重試', warnings=warnings)
+        else:
+            update(jid,status='done',progress=100,frames=len(frames),cues=len(cues),has_subtitles=bool(cues),warnings=warnings)
 
 @app.get('/')
 def home():
     return FileResponse('static/index.html')
 
 @app.post('/api/jobs')
-def create_job(req: JobRequest):
+def create_job(req: JobRequest, request: Request):
+    if req.source != 'youtube':
+        raise HTTPException(400, '目前網址來源僅支援 YouTube')
     try:
         vid = video_id(req.url)
     except ValueError as e:
         raise HTTPException(400,str(e))
-    if not (0.1 <= req.threshold <= 0.8 and 2 <= req.min_gap <= 60 and 1 <= req.max_frames <= 300):
-        raise HTTPException(400,'參數超出允許範圍')
-    if req.summary_language not in gemini.LANGUAGES or req.translate not in ('', *gemini.LANGUAGES):
-        raise HTTPException(400,'不支援的語系')
-    if (req.summary or req.translate) and not gemini.enabled():
-        raise HTTPException(400,'未設定 GEMINI_API_KEY，無法摘要或翻譯')
-    with LOCK:
-        if sum(j['status'] not in ('done','failed') for j in JOBS.values()) >= 1:
-            raise HTTPException(429,'已有任務進行中，請稍後再試')
-        jid = uuid.uuid4().hex
-        JOBS[jid] = {'id':jid,'status':'queued','progress':0,'video_id':vid}
-    thread = threading.Thread(target=process,args=(jid,req.url,req.threshold,req.min_gap,req.max_frames,req.summary,req.summary_language,req.translate),daemon=True)
-    thread.start()
-    return JOBS[jid]
+    validate_options(req)
+    jid = reserve_job(request.state.owner, 'youtube', video_id=vid)
+    try:
+        launch_job(jid, req)
+    except Exception:
+        update(jid, status='failed', error='無法啟動影片任務')
+        raise HTTPException(503, '無法啟動影片任務，請重試')
+    return JOBS[jid].copy()
+
+
+@app.post('/api/jobs/upload', status_code=202)
+async def upload_job(request: Request):
+    if not gemini.enabled():
+        raise HTTPException(400, '請先設定 GEMINI_API_KEY，再使用 MP4 功能')
+    # Reserve before any multipart parsing or spool, using Request.stream directly.
+    jid = reserve_job(request.state.owner, 'mp4', status='uploading')
+    folder = ROOT / jid
+    handed_off = False
+    try:
+        folder.mkdir()
+        video = folder/'video.mp4'
+        filename, fields = await receive_upload(request, video, MAX_UPLOAD_BYTES,
+                                                MAX_REQUEST_OVERHEAD, UPLOAD_IDLE_SECONDS)
+        try:
+            req = JobRequest(url='', **fields)
+        except ValidationError:
+            raise HTTPException(422, '處理參數格式錯誤')
+        validate_options(req)
+        if req.summary or req.translate:
+            raise HTTPException(400, '此版本 MP4 尚未提供逐字稿、摘要與翻譯')
+        try:
+            metadata = await run_upload_io(probe_video, video)
+        except ValueError as exc:
+            raise HTTPException(415, str(exc))
+        metadata['title'] = filename
+        update(jid, status='queued', title=filename, progress=10, warnings=[MP4_WARNING])
+        launch_job(jid, req, video=video, info=metadata)
+        handed_off = True
+        return JOBS[jid].copy()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, '無法接收或啟動影片任務，請重新上傳')
+    finally:
+        if not handed_off:
+            cleanup_warnings = []
+            try:
+                shutil.rmtree(folder)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_warnings.append('部分暫存檔清理失敗，請手動清理 data 目錄。')
+            update(jid, status='failed', error='上傳未完成，請重新上傳', warnings=cleanup_warnings)
 
 # Declared before /api/jobs/{jid} so 'active' is not taken as a job id.
 @app.get('/api/jobs/active')
-def active_job():
+def active_job(request: Request):
     with LOCK:
-        running = [j for j in JOBS.values() if j['status'] not in ('done','failed')]
+        running = [j.copy() for jid, j in JOBS.items() if j['status'] not in ('done','failed')
+                   and OWNERS.get(jid) == request.state.owner]
     if not running:
         raise HTTPException(404,'沒有進行中的任務')
     return running[0]
 
 @app.get('/api/jobs/{jid}')
-def get_job(jid: str):
-    if jid not in JOBS:
-        raise HTTPException(404,'找不到任務')
-    return JOBS[jid]
+def get_job(jid: str, request: Request):
+    return owned_job(jid, request)
 
 @app.get('/api/jobs/{jid}/download')
-def download(jid: str):
-    if jid not in JOBS or JOBS[jid]['status'] != 'done':
+def download(jid: str, request: Request):
+    if owned_job(jid, request)['status'] != 'done':
         raise HTTPException(404,'尚無可下載的結果')
     return FileResponse(ROOT/jid/'result.zip',filename='video-notes.zip',media_type='application/zip')
 
 @app.get('/api/jobs/{jid}/preview')
-def preview(jid: str):
-    if jid not in JOBS or JOBS[jid]['status'] != 'done':
+def preview(jid: str, request: Request):
+    if owned_job(jid, request)['status'] != 'done':
         raise HTTPException(404,'尚無預覽')
     return FileResponse(ROOT/jid/'README.md',media_type='text/markdown; charset=utf-8')

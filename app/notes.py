@@ -1,6 +1,7 @@
 """Chapter-based Markdown rendering, independent of downloading and extraction."""
 
 from typing import TypedDict
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -58,22 +59,32 @@ def paragraphs(cues: list[Cue]) -> list[str]:
 
 
 def render_notes(title: str, url: str, chapters: list[Chapter], frames: list[Frame],
-                 cues: list[Cue], sample_step: int, original_count: int) -> str:
+                 cues: list[Cue], sample_step: int, original_count: int, *,
+                 source: str = 'youtube', warnings: list[str] | None = None) -> str:
     chapters = sorted(chapters, key=lambda chapter: chapter['start_time'])
     frames = sorted(frames, key=lambda frame: frame['time'])
     cues = sorted(cues, key=lambda cue: cue['start'])
     sections = chapters or [Chapter(start_time=0, end_time=float('inf'), title='影片內容')]
     if sections[0]['start_time'] > 0:
         sections = [Chapter(start_time=0, end_time=sections[0]['start_time'], title='章節前內容'), *sections]
-    lines = [f'# {title}', '', f'來源：{url}', '', '## 影片章節', '']
+    # Uploaded names are text, never Markdown links or source paths.
+    display_title = re.sub(r'([\\`*_{}\[\]()<>!#|])', r'\\\1', title) if source == 'mp4' else title
+    lines = [f'# {display_title}', '', f'來源：{display_title if source == "mp4" else url}', '']
+    lines += [f'> {warning}' for warning in (warnings or [])]
+    lines += ['', '## 影片章節', '']
     for chapter in sections:
-        lines.append(f"- [{chapter['title']}]({video_link(url, chapter['start_time'])}) · {timestamp(chapter['start_time'])}")
+        label = chapter['title']
+        if source == 'youtube':
+            label = f"[{label}]({video_link(url, chapter['start_time'])})"
+        lines.append(f"- {label} · {timestamp(chapter['start_time'])}")
     lines += ['', f'影格取樣：每 {sample_step} 秒；通過篩選 {original_count} 張，輸出 {len(frames)} 張。', '',
-              '完整字幕資料：[transcript.json](transcript.json)', '']
+              '逐字稿資料：[transcript.json](transcript.json)', '']
     for index, chapter in enumerate(sections):
         start = chapter['start_time']
         end = sections[index + 1]['start_time'] if index + 1 < len(sections) else float('inf')
-        lines += [f"## {chapter['title']}", '', f"[從 {timestamp(start)} 開始觀看]({video_link(url, start)})", '']
+        watch = (f"[從 {timestamp(start)} 開始觀看]({video_link(url, start)})" if source == 'youtube'
+                 else f'時間：{timestamp(start)}')
+        lines += [f"## {chapter['title']}", '', watch, '']
         section_frames = [frame for frame in frames if start <= frame['time'] < end]
         cursor = start
         for frame_index, frame in enumerate(section_frames):
@@ -87,5 +98,6 @@ def render_notes(title: str, url: str, chapters: list[Chapter], frames: list[Fra
         if not section_frames:
             lines += paragraphs([cue for cue in cues if start <= cue['start'] < end])
     if not cues:
-        lines += ['無可用字幕；未執行語音轉錄。', '']
+        lines += ['沒有可用逐字稿；此版本尚未對 MP4 執行語音轉錄。' if source == 'mp4'
+                  else '無可用字幕；未執行語音轉錄。', '']
     return '\n'.join(lines).rstrip() + '\n'
