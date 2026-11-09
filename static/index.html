@@ -24,10 +24,12 @@ option:hover,option:focus-visible{background:var(--wash);outline:none}
 option:checked{background:var(--chosen);color:var(--teal-deep);font-weight:600}
 option::checkmark{color:var(--teal)}
 }
-button,a.action{display:inline-block;border:0;border-radius:11px;background:var(--teal);color:white;padding:13px 22px;font:inherit;cursor:pointer;text-decoration:none;margin-top:18px;transition:background .15s,translate .15s,box-shadow .15s}
-button:hover:not(:disabled),a.action:hover{background:var(--teal-deep);translate:0 -1px;box-shadow:0 6px 18px #1d5c5626}
+button,a.action,input[type=file]::file-selector-button{display:inline-block;border:0;border-radius:11px;background:var(--teal);color:white;padding:13px 22px;font:inherit;cursor:pointer;text-decoration:none;margin-top:18px;transition:background .15s,translate .15s,box-shadow .15s}
+button:hover:not(:disabled),a.action:hover,input[type=file]:hover:not(:disabled)::file-selector-button{background:var(--teal-deep);translate:0 -1px;box-shadow:0 6px 18px #1d5c5626}
 button:focus-visible,a.action:focus-visible{outline:3px solid var(--chosen);outline-offset:2px}
 button:disabled{opacity:.5;cursor:not-allowed}
+input[type=file]{padding:6px;cursor:pointer}
+input[type=file]::file-selector-button{margin:0 14px 0 0}
 [hidden]{display:none!important}input:disabled,select:disabled{opacity:.55;cursor:not-allowed}
 #file-info{display:block;margin-top:8px;overflow-wrap:anywhere}#source-note{margin:12px 0}
 .row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:160px}small{color:#718096}
