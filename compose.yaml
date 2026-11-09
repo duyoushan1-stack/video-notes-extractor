@@ -5,4 +5,7 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/srv/data
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
     restart: unless-stopped
